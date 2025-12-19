@@ -1,14 +1,69 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"contract_market_demo/backend/models"
+	"contract_market_demo/backend/repos"
 
 	"github.com/google/uuid"
+
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
+
+type Database struct {
+	*gorm.DB
+}
+
+func SetupDB() *Database {
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+	dbUser := os.Getenv("DB_USER")
+	dbPassword := os.Getenv("DB_PASS")
+	dbName := os.Getenv("DB_NAME")
+
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=UTC",
+		dbHost, dbUser, dbPassword, dbName, dbPort)
+
+	newLogger := logger.New(
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
+		logger.Config{
+			SlowThreshold:             time.Second,
+			LogLevel:                  logger.Info,
+			IgnoreRecordNotFoundError: true,
+			Colorful:                  true,
+		},
+	)
+
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: newLogger,
+	})
+	if err != nil {
+		log.Fatalf("failed to connect to database: %v", err)
+	}
+
+	db.Exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"")
+
+	log.Println("Connected to database")
+	return &Database{DB: db}
+}
+
+func (db *Database) AutoMigrate() {
+	db.DB.AutoMigrate(
+		&models.User{},
+		&models.PaymentsAccount{},
+		&models.ContractListing{},
+		&models.ContractHeader{},
+		&models.ContractState{},
+	)
+	log.Println("Database migration complete")
+}
 
 func NewListing(
 	sellerID uuid.UUID,
@@ -41,10 +96,10 @@ func NewState(
 	ownerID uuid.UUID,
 ) *models.ContractState {
 	return &models.ContractState{
-		HeaderID: headerID,
+		HeaderID:       headerID,
 		LastPurchaseAt: time.Now(),
-		OwnerID: ownerID,
-		Status: models.StatusOwned,
+		OwnerID:        ownerID,
+		Status:         models.StatusOwned,
 	}
 }
 
@@ -88,6 +143,13 @@ func ContractPurchaseHandler() http.HandlerFunc {
 }
 
 func main() {
+	db := SetupDB()
+	db.AutoMigrate()
+
+	repos.NewContractListingRepository(db.DB)
+	repos.NewContractHeaderRepository(db.DB)
+	repos.NewContractStateRepository(db.DB)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/listings", HeaderListingHandler())
 	mux.HandleFunc("/v1/contracts", ContractPurchaseHandler())

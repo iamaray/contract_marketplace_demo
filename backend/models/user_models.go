@@ -4,10 +4,10 @@ import (
 	"github.com/google/uuid"
 )
 
-type Seller struct {
+type User struct {
 	ID uuid.UUID
 }
 
 type PaymentsAccount struct {
-	Seller Seller
+	User User
 }
