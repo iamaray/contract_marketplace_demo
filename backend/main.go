@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -103,28 +104,164 @@ func NewState(
 	}
 }
 
+func CreateListing(
+	sellerID uuid.UUID,
+	listPriceNanos int64,
+	supplyLimit uint64,
+	listingRepo repos.ContractListingRepository,
+) (*models.ContractListing, error) {
+	listing := NewListing(
+		sellerID,
+		listPriceNanos,
+		supplyLimit,
+	)
+
+	err := listingRepo.Create(listing)
+	if err != nil {
+		return nil, err
+	}
+
+	return listing, nil
+}
+
 // func GetListing(listingID uuid.UUID) *models.ContractListing {
 
 // }
 
-func HeaderListingHandler() http.HandlerFunc {
+type ListingCreateRequest struct {
+	SellerID       string `json:"seller_id"`
+	ListPriceNanos int64  `json:"list_price_nanos"`
+	SupplyLimit    uint64 `json:"supply_limit"`
+}
+
+type ListingUpdateRequest struct {
+	ListingID      string `json:"listing_id"`
+	ListPriceNanos int64  `json:"list_price_nanos"`
+	SupplyLimit    uint64 `json:"supply_limit"`
+}
+
+type ListingGetRequest struct {
+	ListingID string `json:"listing_id"`
+}
+
+func HeaderListingHandler(
+	listingRepo repos.ContractListingRepository,
+	headerRepo repos.ContractHeaderRepository,
+	stateRepo repos.ContractStateRepository) http.HandlerFunc {
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			req := &ListingCreateRequest{}
+			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			sellerID, err := uuid.Parse(req.SellerID)
+			if err != nil {
+				http.Error(w, "invalid seller_id: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			listing, err := CreateListing(
+				sellerID,
+				req.ListPriceNanos,
+				req.SupplyLimit,
+				listingRepo,
+			)
+			if err != nil {
+				http.Error(w, "failed to create listing: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(listing)
 			return
 		}
 		if r.Method == http.MethodGet {
+			listingID := r.URL.Query().Get("listing_id")
+			if listingID != "" {
+				id, err := uuid.Parse(listingID)
+				if err != nil {
+					http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				listing, err := listingRepo.FindByID(id)
+				if err != nil {
+					http.Error(w, "listing not found: "+err.Error(), http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(listing)
+				return
+			}
+			listings, err := listingRepo.FindAll()
+			if err != nil {
+				http.Error(w, "failed to fetch listings: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(listings)
 			return
 		}
 		if r.Method == http.MethodPut {
+			// update a listing: expect JSON { listing_id, list_price_nanos, supply_limit }
+			req := &ListingUpdateRequest{}
+			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			id, err := uuid.Parse(req.ListingID)
+			if err != nil {
+				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			listing, err := listingRepo.FindByID(id)
+			if err != nil {
+				http.Error(w, "listing not found: "+err.Error(), http.StatusNotFound)
+				return
+			}
+			listing.ListPriceNanos = req.ListPriceNanos
+			listing.SupplyLimit = req.SupplyLimit
+			listing.UpdatedAt = time.Now()
+			if err := listingRepo.Update(listing); err != nil {
+				http.Error(w, "failed to update listing: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(listing)
 			return
 		}
 		if r.Method == http.MethodDelete {
+			listingID := r.URL.Query().Get("listing_id")
+			if listingID == "" {
+				req := &ListingGetRequest{}
+				if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+					http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				listingID = req.ListingID
+			}
+			id, err := uuid.Parse(listingID)
+			if err != nil {
+				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := listingRepo.Delete(id); err != nil {
+				http.Error(w, "failed to delete listing: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 	}
 }
 
-func ContractPurchaseHandler() http.HandlerFunc {
+func ContractPurchaseHandler(
+	listingRepo repos.ContractListingRepository,
+	headerRepo repos.ContractHeaderRepository,
+	stateRepo repos.ContractStateRepository) http.HandlerFunc {
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			// initiate purchase
@@ -146,13 +283,15 @@ func main() {
 	db := SetupDB()
 	db.AutoMigrate()
 
-	repos.NewContractListingRepository(db.DB)
-	repos.NewContractHeaderRepository(db.DB)
-	repos.NewContractStateRepository(db.DB)
+	listing_repo := repos.NewContractListingRepository(db.DB)
+	header_repo := repos.NewContractHeaderRepository(db.DB)
+	state_repo := repos.NewContractStateRepository(db.DB)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/listings", HeaderListingHandler())
-	mux.HandleFunc("/v1/contracts", ContractPurchaseHandler())
+	mux.HandleFunc("/v1/listings", HeaderListingHandler(
+		listing_repo, header_repo, state_repo))
+	mux.HandleFunc("/v1/contracts", ContractPurchaseHandler(
+		listing_repo, header_repo, state_repo))
 
 	srv := &http.Server{
 		Addr:         ":8080",
