@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -62,6 +63,7 @@ func (db *Database) AutoMigrate() {
 		&models.ContractListing{},
 		&models.ContractHeader{},
 		&models.ContractState{},
+		&models.TransactionRecord{},
 	)
 	log.Println("Database migration complete")
 }
@@ -124,7 +126,19 @@ func CreateListing(
 	return listing, nil
 }
 
-// func GetListing(listingID uuid.UUID) *models.ContractListing {
+func GetListing(
+	listingID uuid.UUID,
+	listingRepo repos.ContractListingRepository) (*models.ContractListing, error) {
+	listing, err := listingRepo.FindByID(listingID)
+	if err != nil {
+		return nil, err
+	}
+
+	return listing, nil
+}
+
+// func GetUser(userID uuid.UUID) {
+// 	// retrieve the user from DB
 
 // }
 
@@ -179,14 +193,20 @@ func HeaderListingHandler(
 			return
 		}
 		if r.Method == http.MethodGet {
-			listingID := r.URL.Query().Get("listing_id")
+			req := &ListingGetRequest{}
+			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			listingID := req.ListingID
+
 			if listingID != "" {
-				id, err := uuid.Parse(listingID)
+				listingUUID, err := uuid.Parse(req.ListingID)
 				if err != nil {
-					http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
+					http.Error(w, "invalid seller_id: "+err.Error(), http.StatusBadRequest)
 					return
 				}
-				listing, err := listingRepo.FindByID(id)
+				listing, err := GetListing(listingUUID, listingRepo)
 				if err != nil {
 					http.Error(w, "listing not found: "+err.Error(), http.StatusNotFound)
 					return
@@ -205,7 +225,6 @@ func HeaderListingHandler(
 			return
 		}
 		if r.Method == http.MethodPut {
-			// update a listing: expect JSON { listing_id, list_price_nanos, supply_limit }
 			req := &ListingUpdateRequest{}
 			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -257,23 +276,180 @@ func HeaderListingHandler(
 	}
 }
 
+func IssueFromListing(
+	listing *models.ContractListing,
+	issueQuantity int,
+	listingRepo repos.ContractListingRepository) ([]*models.ContractHeader, []*models.ContractState, error) {
+
+	if issueQuantity > int(listing.SupplyRemaining) {
+		return nil, nil, errors.New("not enough supply")
+	}
+
+	listing.SupplyRemaining -= uint64(issueQuantity)
+	err := listingRepo.Update(listing)
+	if err != nil {
+		// listing.SupplyRemaining += uint64(issueQuantity)
+		return nil, nil, err
+	}
+
+	headers := make([]*models.ContractHeader, issueQuantity)
+	states := make([]*models.ContractState, issueQuantity)
+	for i := 0; i < issueQuantity; i++ {
+		header := NewHeader(listing.ID)
+		headers[i] = header
+
+		state := &models.ContractState{
+			HeaderID:       header.ID,
+			LastPurchaseAt: time.Now(),
+			OwnerID:        listing.SellerID,
+			Status:         models.StatusListed,
+		}
+		states[i] = state
+	}
+
+	return headers, states, nil
+}
+
+func TransferOwnership(
+	buyerID uuid.UUID,
+	state *models.ContractState,
+	userRepo repos.UserRepository,
+	stateRepo repos.ContractStateRepository) (uuid.UUID, error) {
+	_, err := userRepo.FindByID(buyerID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	prevOwner := state.OwnerID
+	state.OwnerID = buyerID
+	state.LastPurchaseAt = time.Now()
+	state.Status = models.StatusOwned
+
+	err = stateRepo.Update(state)
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	return prevOwner, nil
+}
+
+func SettleTransaction(record *models.TransactionRecord) (*models.TransactionRecord, error) {
+	// Settle the transaction and emit a transaction record.
+	// This function will be the main entrypoint to the
+	// Stripe Connect logic.
+
+	return record, nil
+}
+
+func Transact(
+	listingID uuid.UUID,
+	buyerID uuid.UUID,
+	purchaseQuantity int,
+	userRepo repos.UserRepository,
+	listingRepo repos.ContractListingRepository,
+	headerRepo repos.ContractHeaderRepository,
+	stateRepo repos.ContractStateRepository) (*models.TransactionRecord, error) {
+
+	record := &models.TransactionRecord{
+		ListingID:         listingID,
+		SellerID:          uuid.Nil,
+		BuyerID:           buyerID,
+		PurchaseQuantity:  purchaseQuantity,
+		TransactionStatus: models.StatusPending,
+	}
+
+	listing, err := GetListing(listingID, listingRepo)
+	if err != nil {
+		record.TransactionStatus = models.StatusFailed
+		return record, err
+	}
+	record.SellerID = listing.SellerID
+
+	_, states, err := IssueFromListing(listing, purchaseQuantity, listingRepo)
+	if err != nil {
+		record.TransactionStatus = models.StatusFailed
+		return record, err
+	}
+
+	for i := 0; i < purchaseQuantity; i++ {
+		_, err := TransferOwnership(buyerID, states[i], userRepo, stateRepo)
+		if err != nil {
+			record.TransactionStatus = models.StatusFailed
+			return record, err
+		}
+	}
+
+	record, err = SettleTransaction(record)
+	if record.TransactionStatus == models.StatusFailed || err != nil {
+		listing.SupplyRemaining += uint64(purchaseQuantity)
+		err = listingRepo.Update(listing)
+		if err != nil {
+			return record, errors.New("error restoring supply after failed transaction")
+		}
+		return record, err
+	}
+
+	// commit the record to DB
+
+	return record, err
+}
+
+type ContractPurchaseRequest struct {
+	BuyerID          string
+	ListingID        string
+	PurchaseQuantity int
+}
+
 func ContractPurchaseHandler(
+	userRepo repos.UserRepository,
 	listingRepo repos.ContractListingRepository,
 	headerRepo repos.ContractHeaderRepository,
 	stateRepo repos.ContractStateRepository) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			// initiate purchase
+			req := &ContractPurchaseRequest{}
+			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+			}
+
+			buyerID, err := uuid.Parse(req.BuyerID)
+			if err != nil {
+				http.Error(w, "invalid buyer_id: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			listingID, err := uuid.Parse(req.ListingID)
+			if err != nil {
+				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			_, err = Transact(
+				listingID,
+				buyerID,
+				req.PurchaseQuantity,
+				userRepo,
+				listingRepo,
+				headerRepo,
+				stateRepo)
+
+			if err != nil {
+				http.Error(w, "transaction error: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 			return
 		}
 		if r.Method == http.MethodGet {
+			// retrieve a transaction record.
 			return
 		}
 		if r.Method == http.MethodPut {
+			// update a transaction record
 			return
 		}
 		if r.Method == http.MethodDelete {
+			// delete a transaction record
 			return
 		}
 	}

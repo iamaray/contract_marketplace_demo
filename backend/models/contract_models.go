@@ -17,6 +17,14 @@ const (
 	StatusExpired
 )
 
+type TransactionStatus uint8
+
+const (
+	StatusPending TransactionStatus = iota
+	StatusSuccess
+	StatusFailed
+)
+
 type ContractListing struct {
 	ID              uuid.UUID
 	SellerID        uuid.UUID
@@ -38,4 +46,13 @@ type ContractState struct {
 	LastPurchaseAt time.Time
 	OwnerID        uuid.UUID
 	Status         ContractStatus
+}
+
+type TransactionRecord struct {
+	ListingID         uuid.UUID
+	SellerID          uuid.UUID
+	BuyerID           uuid.UUID
+	PurchaseQuantity  int
+	PurchasePrice     uint64
+	TransactionStatus TransactionStatus
 }
