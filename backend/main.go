@@ -346,6 +346,7 @@ func Transact(
 	buyerID uuid.UUID,
 	purchaseQuantity int,
 	userRepo repos.UserRepository,
+	transactionRepo repos.TransactionRepository,
 	listingRepo repos.ContractListingRepository,
 	headerRepo repos.ContractHeaderRepository,
 	stateRepo repos.ContractStateRepository) (*models.TransactionRecord, error) {
@@ -357,17 +358,25 @@ func Transact(
 		PurchaseQuantity:  purchaseQuantity,
 		TransactionStatus: models.StatusPending,
 	}
+	// handle this error by just logging it
+	_ = transactionRepo.Create(record)
 
 	listing, err := GetListing(listingID, listingRepo)
 	if err != nil {
 		record.TransactionStatus = models.StatusFailed
+		// handle this error by just logging it
+		_ = transactionRepo.Update(record)
 		return record, err
 	}
 	record.SellerID = listing.SellerID
+	// handle this error by just logging it
+	_ = transactionRepo.Update(record)
 
 	_, states, err := IssueFromListing(listing, purchaseQuantity, listingRepo)
 	if err != nil {
 		record.TransactionStatus = models.StatusFailed
+		// handle this error by just logging it
+		_ = transactionRepo.Update(record)
 		return record, err
 	}
 
@@ -375,11 +384,16 @@ func Transact(
 		_, err := TransferOwnership(buyerID, states[i], userRepo, stateRepo)
 		if err != nil {
 			record.TransactionStatus = models.StatusFailed
+			// handle this error by just logging it
+			_ = transactionRepo.Update(record)
 			return record, err
 		}
 	}
 
 	record, err = SettleTransaction(record)
+	// handle this error by just logging it
+	_ = transactionRepo.Update(record)
+
 	if record.TransactionStatus == models.StatusFailed || err != nil {
 		listing.SupplyRemaining += uint64(purchaseQuantity)
 		err = listingRepo.Update(listing)
@@ -402,6 +416,7 @@ type ContractPurchaseRequest struct {
 
 func ContractPurchaseHandler(
 	userRepo repos.UserRepository,
+	transactionRepo repos.TransactionRepository,
 	listingRepo repos.ContractListingRepository,
 	headerRepo repos.ContractHeaderRepository,
 	stateRepo repos.ContractStateRepository) http.HandlerFunc {
@@ -430,6 +445,7 @@ func ContractPurchaseHandler(
 				buyerID,
 				req.PurchaseQuantity,
 				userRepo,
+				transactionRepo,
 				listingRepo,
 				headerRepo,
 				stateRepo)
@@ -459,15 +475,17 @@ func main() {
 	db := SetupDB()
 	db.AutoMigrate()
 
-	listing_repo := repos.NewContractListingRepository(db.DB)
-	header_repo := repos.NewContractHeaderRepository(db.DB)
-	state_repo := repos.NewContractStateRepository(db.DB)
+	userRepo := repos.NewUserRepository(db.DB)
+	transactionRepo := repos.NewTransactionRepository(db.DB)
+	listingRepo := repos.NewContractListingRepository(db.DB)
+	headerRepo := repos.NewContractHeaderRepository(db.DB)
+	stateRepo := repos.NewContractStateRepository(db.DB)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/listings", HeaderListingHandler(
-		listing_repo, header_repo, state_repo))
+		listingRepo, headerRepo, stateRepo))
 	mux.HandleFunc("/v1/contracts", ContractPurchaseHandler(
-		listing_repo, header_repo, state_repo))
+		userRepo, transactionRepo, listingRepo, headerRepo, stateRepo))
 
 	srv := &http.Server{
 		Addr:         ":8080",
