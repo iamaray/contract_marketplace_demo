@@ -12,11 +12,15 @@ import (
 	"contract_market_demo/backend/models"
 	"contract_market_demo/backend/repos"
 
+	"github.com/clerk/clerk-sdk-go/v2"
+	clerkhttp "github.com/clerk/clerk-sdk-go/v2/http"
 	"github.com/google/uuid"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+
+	"github.com/joho/godotenv"
 )
 
 type Database struct {
@@ -59,7 +63,7 @@ func SetupDB() *Database {
 func (db *Database) AutoMigrate() {
 	db.DB.AutoMigrate(
 		&models.User{},
-		&models.PaymentsAccount{},
+		// &models.PaymentsAccount{},
 		&models.ContractListing{},
 		&models.ContractHeader{},
 		&models.ContractState{},
@@ -137,13 +141,22 @@ func GetListing(
 	return listing, nil
 }
 
+func CurrentUser(r *http.Request, userRepo repos.UserRepository) (*models.User, error) {
+	claims, ok := clerk.SessionClaimsFromContext(r.Context())
+	if !ok {
+		return nil, errors.New("unauthenticated")
+	}
+	sub := claims.Subject
+
+	return userRepo.FindOrCreateByAuth("clerk", sub, "")
+}
+
 // func GetUser(userID uuid.UUID) {
 // 	// retrieve the user from DB
 
 // }
 
 type ListingCreateRequest struct {
-	SellerID       string `json:"seller_id"`
 	ListPriceNanos int64  `json:"list_price_nanos"`
 	SupplyLimit    uint64 `json:"supply_limit"`
 }
@@ -161,7 +174,8 @@ type ListingGetRequest struct {
 func HeaderListingHandler(
 	listingRepo repos.ContractListingRepository,
 	headerRepo repos.ContractHeaderRepository,
-	stateRepo repos.ContractStateRepository) http.HandlerFunc {
+	stateRepo repos.ContractStateRepository,
+	userRepo repos.UserRepository) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -170,11 +184,18 @@ func HeaderListingHandler(
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			sellerID, err := uuid.Parse(req.SellerID)
+
+			u, err := CurrentUser(r, userRepo)
 			if err != nil {
-				http.Error(w, "invalid seller_id: "+err.Error(), http.StatusBadRequest)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
+			sellerID := u.ID
+			// sellerID, err := uuid.Parse(req.SellerID)
+			// if err != nil {
+			// 	http.Error(w, "invalid seller_id: "+err.Error(), http.StatusBadRequest)
+			// 	return
+			// }
 
 			listing, err := CreateListing(
 				sellerID,
@@ -240,6 +261,17 @@ func HeaderListingHandler(
 				http.Error(w, "listing not found: "+err.Error(), http.StatusNotFound)
 				return
 			}
+
+			u, err := CurrentUser(r, userRepo)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if listing.SellerID != u.ID {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
 			listing.ListPriceNanos = req.ListPriceNanos
 			listing.SupplyLimit = req.SupplyLimit
 			listing.UpdatedAt = time.Now()
@@ -261,7 +293,24 @@ func HeaderListingHandler(
 				}
 				listingID = req.ListingID
 			}
+
 			id, err := uuid.Parse(listingID)
+			listing, err := GetListing(id, listingRepo)
+			if err != nil {
+				http.Error(w, "listing not found", http.StatusBadRequest)
+				return
+			}
+
+			u, err := CurrentUser(r, userRepo)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if listing.SellerID != u.ID {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+
 			if err != nil {
 				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
 				return
@@ -409,7 +458,6 @@ func Transact(
 }
 
 type ContractPurchaseRequest struct {
-	BuyerID          string
 	ListingID        string
 	PurchaseQuantity int
 }
@@ -428,11 +476,11 @@ func ContractPurchaseHandler(
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			}
 
-			buyerID, err := uuid.Parse(req.BuyerID)
-			if err != nil {
-				http.Error(w, "invalid buyer_id: "+err.Error(), http.StatusBadRequest)
-				return
-			}
+			// buyerID, err := uuid.Parse(req.BuyerID)
+			// if err != nil {
+			// 	http.Error(w, "invalid buyer_id: "+err.Error(), http.StatusBadRequest)
+			// 	return
+			// }
 
 			listingID, err := uuid.Parse(req.ListingID)
 			if err != nil {
@@ -440,9 +488,14 @@ func ContractPurchaseHandler(
 				return
 			}
 
+			u, err := CurrentUser(r, userRepo)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			}
+
 			_, err = Transact(
 				listingID,
-				buyerID,
+				u.ID,
 				req.PurchaseQuantity,
 				userRepo,
 				transactionRepo,
@@ -471,7 +524,27 @@ func ContractPurchaseHandler(
 	}
 }
 
+func MeHandler(userRepo repos.UserRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u, err := CurrentUser(r, userRepo)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, _ := clerk.SessionClaimsFromContext(r.Context())
+		resp := map[string]any{
+			"user_id":  u.ID.String(),
+			"subject":  claims.Subject,
+			"provider": u.AuthProvider,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
 func main() {
+	clerk.SetKey(os.Getenv("CLERK_SECRET_KEY"))
+	_ = godotenv.Load()
 	db := SetupDB()
 	db.AutoMigrate()
 
@@ -481,11 +554,18 @@ func main() {
 	headerRepo := repos.NewContractHeaderRepository(db.DB)
 	stateRepo := repos.NewContractStateRepository(db.DB)
 
+	// _, _ = CreateDummySellers(10, db.DB)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/listings", HeaderListingHandler(
-		listingRepo, headerRepo, stateRepo))
-	mux.HandleFunc("/v1/contracts", ContractPurchaseHandler(
+	listings := http.HandlerFunc(HeaderListingHandler(
+		listingRepo, headerRepo, stateRepo, userRepo))
+	mux.Handle("/v1/listings", clerkhttp.WithHeaderAuthorization()(listings))
+
+	contracts := http.HandlerFunc(ContractPurchaseHandler(
 		userRepo, transactionRepo, listingRepo, headerRepo, stateRepo))
+	mux.Handle("/v1/contracts", clerkhttp.RequireHeaderAuthorization()(contracts))
+
+	mux.Handle("/v1/me", clerkhttp.RequireHeaderAuthorization()(http.HandlerFunc(MeHandler(userRepo))))
 
 	srv := &http.Server{
 		Addr:         ":8080",

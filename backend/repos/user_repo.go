@@ -8,8 +8,12 @@ import (
 	"gorm.io/gorm"
 )
 
+var ErrUserNotFound = errors.New("User not found")
+
 type UserRepository interface {
 	BaseRepository[models.User]
+	FindByAuth(provider, subject string) (*models.User, error)
+	FindOrCreateByAuth(provider, subject, email string) (*models.User, error)
 }
 
 type userRepository struct {
@@ -30,6 +34,43 @@ func (r *userRepository) FindByID(id uuid.UUID) (*models.User, error) {
 		return nil, result.Error
 	}
 	return &user, nil
+}
+
+func (r *userRepository) FindByAuth(provider, subject string) (*models.User, error) {
+	var user models.User
+	result := r.db.First(&user, "auth_provider = ? AND auth_subject = ?", provider, subject)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, result.Error
+	}
+	return &user, nil
+}
+
+func (r *userRepository) FindOrCreateByAuth(provider, subject, email string) (*models.User, error) {
+	u, err := r.FindByAuth(provider, subject)
+	if err == nil {
+		if u.Email == "" && email != "" {
+			u.Email = email
+			_ = r.Update(u)
+		}
+		return u, nil
+	}
+	if !errors.Is(err, ErrUserNotFound) {
+		return nil, err
+	}
+
+	user := &models.User{
+		ID:           uuid.New(),
+		Email:        email,
+		AuthProvider: provider,
+		AuthSubject:  subject,
+	}
+	if err := r.Create(user); err != nil {
+		return nil, err
+	}
+	return user, nil
 }
 
 func (r *userRepository) FindAll() ([]models.User, error) {
