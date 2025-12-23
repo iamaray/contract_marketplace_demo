@@ -310,11 +310,6 @@ func HeaderListingHandler(
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
-
-			if err != nil {
-				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
-				return
-			}
 			if err := listingRepo.Delete(id); err != nil {
 				http.Error(w, "failed to delete listing: "+err.Error(), http.StatusInternalServerError)
 				return
