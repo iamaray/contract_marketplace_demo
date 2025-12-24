@@ -151,11 +151,6 @@ func CurrentUser(r *http.Request, userRepo repos.UserRepository) (*models.User, 
 	return userRepo.FindOrCreateByAuth("clerk", sub, "")
 }
 
-// func GetUser(userID uuid.UUID) {
-// 	// retrieve the user from DB
-
-// }
-
 type ListingCreateRequest struct {
 	ListPriceNanos int64  `json:"list_price_nanos"`
 	SupplyLimit    uint64 `json:"supply_limit"`
@@ -191,12 +186,6 @@ func HeaderListingHandler(
 				return
 			}
 			sellerID := u.ID
-			// sellerID, err := uuid.Parse(req.SellerID)
-			// if err != nil {
-			// 	http.Error(w, "invalid seller_id: "+err.Error(), http.StatusBadRequest)
-			// 	return
-			// }
-
 			listing, err := CreateListing(
 				sellerID,
 				req.ListPriceNanos,
@@ -470,13 +459,7 @@ func ContractPurchaseHandler(
 			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			}
-
-			// buyerID, err := uuid.Parse(req.BuyerID)
-			// if err != nil {
-			// 	http.Error(w, "invalid buyer_id: "+err.Error(), http.StatusBadRequest)
-			// 	return
-			// }
-
+			
 			listingID, err := uuid.Parse(req.ListingID)
 			if err != nil {
 				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
