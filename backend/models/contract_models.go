@@ -14,14 +14,17 @@ const (
 	StatusMatched
 	StatusOwned
 	StatusUnlocked
-	StatusExpired
+	StatusExpiryReached
 )
 
 type TransactionStatus uint8
 
 const (
 	StatusPending TransactionStatus = iota
-	StatusSuccess
+	StatusRequiresPayment
+	StatusPaid
+	StatusFulfilled
+	StatusExpired
 	StatusFailed
 )
 
@@ -49,10 +52,20 @@ type ContractState struct {
 }
 
 type TransactionRecord struct {
+	ID				  uuid.UUID
+	InitiatedAt       time.Time
 	ListingID         uuid.UUID
 	SellerID          uuid.UUID
 	BuyerID           uuid.UUID
-	PurchaseQuantity  int
-	PurchasePrice     uint64
+	PurchaseQuantity  int64
+	PurchaseCents     uint64
 	TransactionStatus TransactionStatus
+
+	StripeCheckoutSessonID string
+	StripePaymentIntentID  string
+	Currency               string
+	PlatformFeeCents       int64
+	FulfilledAt            *time.Time
+	IsFulfilled            bool
+	StripeEventLastID      string
 }

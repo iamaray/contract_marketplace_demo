@@ -16,6 +16,11 @@ type User struct {
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
+
+	StripeConnectAccountID string
+	StripeChargesEnabled   bool
+	StripePayoutsEnabled   bool
+	StripeDetailsSubmitted bool
 }
 
 // type PaymentsAccount struct {

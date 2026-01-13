@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"contract_market_demo/backend/models"
@@ -21,6 +22,11 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/joho/godotenv"
+
+	"github.com/stripe/stripe-go/v82"
+	"github.com/stripe/stripe-go/v82/account"
+	"github.com/stripe/stripe-go/v82/accountlink"
+	"github.com/stripe/stripe-go/v82/checkout/session"
 )
 
 type Database struct {
@@ -374,133 +380,255 @@ func SettleTransaction(record *models.TransactionRecord) (*models.TransactionRec
 	return record, nil
 }
 
-func Transact(
-	listingID uuid.UUID,
-	buyerID uuid.UUID,
-	purchaseQuantity int,
-	userRepo repos.UserRepository,
-	transactionRepo repos.TransactionRepository,
-	listingRepo repos.ContractListingRepository,
-	headerRepo repos.ContractHeaderRepository,
-	stateRepo repos.ContractStateRepository) (*models.TransactionRecord, error) {
+// DEPRICATED
 
-	record := &models.TransactionRecord{
-		ListingID:         listingID,
-		SellerID:          uuid.Nil,
-		BuyerID:           buyerID,
-		PurchaseQuantity:  purchaseQuantity,
-		TransactionStatus: models.StatusPending,
-	}
-	// handle this error by just logging it
-	_ = transactionRepo.Create(record)
+// func Transact(
+// 	listingID uuid.UUID,
+// 	buyerID uuid.UUID,
+// 	purchaseQuantity int,
+// 	userRepo repos.UserRepository,
+// 	transactionRepo repos.TransactionRepository,
+// 	listingRepo repos.ContractListingRepository,
+// 	headerRepo repos.ContractHeaderRepository,
+// 	stateRepo repos.ContractStateRepository) (*models.TransactionRecord, error) {
 
-	listing, err := GetListing(listingID, listingRepo)
-	if err != nil {
-		record.TransactionStatus = models.StatusFailed
-		// handle this error by just logging it
-		_ = transactionRepo.Update(record)
-		return record, err
-	}
-	record.SellerID = listing.SellerID
-	// handle this error by just logging it
-	_ = transactionRepo.Update(record)
+// 	record := &models.TransactionRecord{
+// 		ListingID:         listingID,
+// 		SellerID:          uuid.Nil,
+// 		BuyerID:           buyerID,
+// 		PurchaseQuantity:  int64(purchaseQuantity),
+// 		TransactionStatus: models.StatusPending,
+// 	}
+// 	// handle this error by just logging it
+// 	_ = transactionRepo.Create(record)
 
-	_, states, err := IssueFromListing(listing, purchaseQuantity, listingRepo)
-	if err != nil {
-		record.TransactionStatus = models.StatusFailed
-		// handle this error by just logging it
-		_ = transactionRepo.Update(record)
-		return record, err
-	}
+// 	listing, err := GetListing(listingID, listingRepo)
+// 	if err != nil {
+// 		record.TransactionStatus = models.StatusFailed
+// 		// handle this error by just logging it
+// 		_ = transactionRepo.Update(record)
+// 		return record, err
+// 	}
+// 	record.SellerID = listing.SellerID
+// 	// handle this error by just logging it
+// 	_ = transactionRepo.Update(record)
 
-	for i := 0; i < purchaseQuantity; i++ {
-		_, err := TransferOwnership(buyerID, states[i], userRepo, stateRepo)
-		if err != nil {
-			record.TransactionStatus = models.StatusFailed
-			// handle this error by just logging it
-			_ = transactionRepo.Update(record)
-			return record, err
-		}
-	}
+// 	_, states, err := IssueFromListing(listing, purchaseQuantity, listingRepo)
+// 	if err != nil {
+// 		record.TransactionStatus = models.StatusFailed
+// 		// handle this error by just logging it
+// 		_ = transactionRepo.Update(record)
+// 		return record, err
+// 	}
 
-	record, err = SettleTransaction(record)
-	// handle this error by just logging it
-	_ = transactionRepo.Update(record)
+// 	for i := 0; i < purchaseQuantity; i++ {
+// 		_, err := TransferOwnership(buyerID, states[i], userRepo, stateRepo)
+// 		if err != nil {
+// 			record.TransactionStatus = models.StatusFailed
+// 			// handle this error by just logging it
+// 			_ = transactionRepo.Update(record)
+// 			return record, err
+// 		}
+// 	}
 
-	if record.TransactionStatus == models.StatusFailed || err != nil {
-		listing.SupplyRemaining += uint64(purchaseQuantity)
-		err = listingRepo.Update(listing)
-		if err != nil {
-			return record, errors.New("error restoring supply after failed transaction")
-		}
-		return record, err
-	}
+// 	record, err = SettleTransaction(record)
+// 	// handle this error by just logging it
+// 	_ = transactionRepo.Update(record)
 
-	// commit the record to DB
+// 	if record.TransactionStatus == models.StatusFailed || err != nil {
+// 		listing.SupplyRemaining += uint64(purchaseQuantity)
+// 		err = listingRepo.Update(listing)
+// 		if err != nil {
+// 			return record, errors.New("error restoring supply after failed transaction")
+// 		}
+// 		return record, err
+// 	}
 
-	return record, err
-}
+// 	// commit the record to DB
+
+// 	return record, err
+// }
 
 type ContractPurchaseRequest struct {
 	ListingID        string
 	PurchaseQuantity int
 }
 
-func ContractPurchaseHandler(
+func CheckoutHandler(
 	userRepo repos.UserRepository,
 	transactionRepo repos.TransactionRepository,
 	listingRepo repos.ContractListingRepository,
-	headerRepo repos.ContractHeaderRepository,
-	stateRepo repos.ContractStateRepository) http.HandlerFunc {
-
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			req := &ContractPurchaseRequest{}
-			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
-				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
-			}
-			
-			listingID, err := uuid.Parse(req.ListingID)
-			if err != nil {
-				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
-				return
-			}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
 
-			u, err := CurrentUser(r, userRepo)
-			if err != nil {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-			}
+		buyer, err := CurrentUser(r, userRepo)
+		if err != nil {
+			http.Error(w, "not authorized", 401)
+			return
+		}
 
-			_, err = Transact(
-				listingID,
-				u.ID,
-				req.PurchaseQuantity,
-				userRepo,
-				transactionRepo,
-				listingRepo,
-				headerRepo,
-				stateRepo)
+		var req ContractPurchaseRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if req.PurchaseQuantity <= 0 {
+			http.Error(w, "purchase quantity must be positive", 400)
+			return
+		}
 
-			if err != nil {
-				http.Error(w, "transaction error: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
+		listingID, err := uuid.Parse(req.ListingID)
+		if err != nil {
+			http.Error(w, "invalid listing ID", 400)
 			return
 		}
-		if r.Method == http.MethodGet {
-			// retrieve a transaction record.
+		listing, err := listingRepo.FindByID(listingID)
+		if err != nil {
+			http.Error(w, "listing not found", 404)
 			return
 		}
-		if r.Method == http.MethodPut {
-			// update a transaction record
+		if listing.SupplyRemaining < uint64(req.PurchaseQuantity) {
+			http.Error(w, "purchase quantity exceeds available supply", 404)
 			return
 		}
-		if r.Method == http.MethodDelete {
-			// delete a transaction record
+
+		seller, err := userRepo.FindByID(listing.SellerID)
+		if err != nil {
+			http.Error(w, "seller not found", 500)
 			return
 		}
+		if seller.StripeConnectAccountID == "" {
+			http.Error(w, "seller is not onboarded", 409)
+			return
+		}
+
+		unitCents := (listing.ListPriceNanos + 5_000_000) / 10_000_000
+		totalCents := unitCents * int64(req.PurchaseQuantity)
+
+		feeBps := int64(0)
+		fmt.Sscanf(os.Getenv("PLATFORM_FEE_BPS"), "%d", &feeBps)
+		platformFee := (totalCents * feeBps) / 10_000
+
+		tr := &models.TransactionRecord{
+			ID:                uuid.New(),
+			InitiatedAt:       time.Now(),
+			ListingID:         listing.ID,
+			SellerID:          listing.SellerID,
+			BuyerID:           buyer.ID,
+			PurchaseQuantity:  int64(req.PurchaseQuantity),
+			PurchaseCents:     uint64(totalCents),
+			Currency:          os.Getenv("CURRENCY"),
+			PlatformFeeCents:  platformFee,
+			TransactionStatus: models.StatusRequiresPayment,
+		}
+		_ = transactionRepo.Create(tr)
+
+		params := &stripe.CheckoutSessionParams{
+			Mode:       stripe.String(string(stripe.CheckoutSessionModePayment)),
+			SuccessURL: stripe.String(strings.ReplaceAll(os.Getenv("STRIPE_SUCCESS_URL"), "{TRANSACTION_ID}", tr.ID.String())),
+			CancelURL:  stripe.String(strings.ReplaceAll(os.Getenv("STRIPE_CANCEL_URL"), "{TRANSACTION_ID}", tr.ID.String())),
+			LineItems: []*stripe.CheckoutSessionLineItemParams{
+				{
+					Quantity: stripe.Int64(int64(req.PurchaseQuantity)),
+					PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+						Currency:   stripe.String(os.Getenv("CURRENCY")),
+						UnitAmount: stripe.Int64(unitCents),
+						ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+							Name: stripe.String("Data Contract"),
+						},
+					},
+				},
+			},
+			PaymentIntentData: &stripe.CheckoutSessionPaymentIntentDataParams{
+				ApplicationFeeAmount: stripe.Int64(platformFee),
+				TransferData: &stripe.CheckoutSessionPaymentIntentDataTransferDataParams{
+					Destination: stripe.String(seller.StripeConnectAccountID),
+				},
+				Metadata: map[string]string{
+					"transaction_id": tr.ID.String(),
+					"listing_id":     listing.ID.String(),
+					"buyer_id":       buyer.ID.String(),
+				},
+			},
+			ClientReferenceID: stripe.String(tr.ID.String()),
+		}
+		s, err := session.New(params)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		tr.StripeCheckoutSessonID = s.ID
+		_ = transactionRepo.Update(tr)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"transaction_id": tr.ID.String(),
+			"checkout_url":   s.URL,
+		})
+
 	}
 }
+
+// func ContractPurchaseHandler(
+// 	userRepo repos.UserRepository,
+// 	transactionRepo repos.TransactionRepository,
+// 	listingRepo repos.ContractListingRepository,
+// 	headerRepo repos.ContractHeaderRepository,
+// 	stateRepo repos.ContractStateRepository) http.HandlerFunc {
+
+// 	return func(w http.ResponseWriter, r *http.Request) {
+// 		if r.Method == http.MethodPost {
+// 			req := &ContractPurchaseRequest{}
+// 			if err := json.NewDecoder(r.Body).Decode(req); err != nil {
+// 				http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+// 			}
+
+// 			listingID, err := uuid.Parse(req.ListingID)
+// 			if err != nil {
+// 				http.Error(w, "invalid listing_id: "+err.Error(), http.StatusBadRequest)
+// 				return
+// 			}
+
+// 			u, err := CurrentUser(r, userRepo)
+// 			if err != nil {
+// 				http.Error(w, "unauthorized", http.StatusUnauthorized)
+// 			}
+
+// 			_, err = Transact(
+// 				listingID,
+// 				u.ID,
+// 				req.PurchaseQuantity,
+// 				userRepo,
+// 				transactionRepo,
+// 				listingRepo,
+// 				headerRepo,
+// 				stateRepo)
+
+// 			if err != nil {
+// 				http.Error(w, "transaction error: "+err.Error(), http.StatusInternalServerError)
+// 				return
+// 			}
+// 			return
+// 		}
+// 		if r.Method == http.MethodGet {
+// 			// retrieve a transaction record.
+// 			return
+// 		}
+// 		if r.Method == http.MethodPut {
+// 			// update a transaction record
+// 			return
+// 		}
+// 		if r.Method == http.MethodDelete {
+// 			// delete a transaction record
+// 			return
+// 		}
+// 	}
+// }
 
 func MeHandler(userRepo repos.UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -520,9 +648,59 @@ func MeHandler(userRepo repos.UserRepository) http.HandlerFunc {
 	}
 }
 
+func ConnectOnboardHandler(userRepo repos.UserRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		u, err := CurrentUser(r, userRepo)
+		if err != nil {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+
+		if u.StripeConnectAccountID == "" {
+			params := &stripe.AccountParams{
+				Type:    stripe.String(string(stripe.AccountTypeExpress)),
+				Country: stripe.String("US"),
+				Capabilities: &stripe.AccountCapabilitiesParams{
+					Transfers:    &stripe.AccountCapabilitiesTransfersParams{Requested: stripe.Bool(true)},
+					CardPayments: &stripe.AccountCapabilitiesCardPaymentsParams{Requested: stripe.Bool(true)},
+				},
+			}
+			acct, err := account.New(params)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+
+			u.StripeConnectAccountID = acct.ID
+			_ = userRepo.Update(u)
+		}
+
+		al, err := accountlink.New(&stripe.AccountLinkParams{
+			Account:    stripe.String(u.StripeConnectAccountID),
+			Type:       stripe.String("account_onboarding"),
+			ReturnURL:  stripe.String(os.Getenv("CONNECT_RETURN_URL")),
+			RefreshURL: stripe.String(os.Getenv("CONNECT_REFRESH_URL")),
+		})
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"url": al.URL})
+	}
+}
+
 func main() {
-	clerk.SetKey(os.Getenv("CLERK_SECRET_KEY"))
 	_ = godotenv.Load()
+
+	clerk.SetKey(os.Getenv("CLERK_SECRET_KEY"))
+	stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
+
 	db := SetupDB()
 	db.AutoMigrate()
 
@@ -532,18 +710,21 @@ func main() {
 	headerRepo := repos.NewContractHeaderRepository(db.DB)
 	stateRepo := repos.NewContractStateRepository(db.DB)
 
-	// _, _ = CreateDummySellers(10, db.DB)
-
 	mux := http.NewServeMux()
-	listings := http.HandlerFunc(HeaderListingHandler(
-		listingRepo, headerRepo, stateRepo, userRepo))
-	mux.Handle("/v1/listings", clerkhttp.WithHeaderAuthorization()(listings))
 
-	contracts := http.HandlerFunc(ContractPurchaseHandler(
-		userRepo, transactionRepo, listingRepo, headerRepo, stateRepo))
-	mux.Handle("/v1/contracts", clerkhttp.RequireHeaderAuthorization()(contracts))
+	mux.Handle("/v1/listings", clerkhttp.WithHeaderAuthorization()(
+		HeaderListingHandler(
+			listingRepo, headerRepo, stateRepo, userRepo)))
 
-	mux.Handle("/v1/me", clerkhttp.RequireHeaderAuthorization()(http.HandlerFunc(MeHandler(userRepo))))
+	mux.Handle("/v1/contracts", clerkhttp.RequireHeaderAuthorization()(
+		ContractPurchaseHandler(
+			userRepo, transactionRepo, listingRepo, headerRepo, stateRepo)))
+
+	mux.Handle("/v1/me", clerkhttp.RequireHeaderAuthorization()(
+		MeHandler(userRepo)))
+
+	mux.Handle("/v1/connect/onboard", clerkhttp.RequireHeaderAuthorization()(
+		ConnectOnboardHandler(userRepo)))
 
 	srv := &http.Server{
 		Addr:         ":8080",
